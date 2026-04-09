@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
+from PIL import Image
 
 load_dotenv()
 
@@ -29,9 +30,29 @@ class ThumbnailStates(StatesGroup):
     waiting_for_image = State()
     processing = State()
 
+async def compress_image(input_path: str, output_path: str, max_size_kb: int = 200, max_width: int = 320) -> str:
+    """
+    Rasmni o'lchamini kichraytirib, sifatini pasaytirib, 200 KB dan kichik qiladi.
+    """
+    img = Image.open(input_path)
+    # O'lchamni kichraytirish
+    if img.width > max_width or img.height > max_width:
+        img.thumbnail((max_width, max_width))
+    # Sifatni pasaytirib saqlash
+    quality = 85
+    img.save(output_path, 'JPEG', quality=quality, optimize=True)
+    
+    # Agar fayl hali ham katta bo'lsa, sifatni tushirib qayta saqlash
+    while os.path.getsize(output_path) > max_size_kb * 1024 and quality > 10:
+        quality -= 10
+        img.save(output_path, 'JPEG', quality=quality, optimize=True)
+    
+    logger.info(f"Rasm siqildi: {os.path.getsize(output_path)} bytes")
+    return output_path
+
 async def add_thumbnail_to_video(video_path: str, image_path: str, output_path: str) -> bool:
     """
-    FFmpeg yordamida videoga thumbnail qo'shish.
+    FFmpeg yordamida videoga thumbnail qo'shish (qayta kodlamasdan).
     """
     cmd = [
         'ffmpeg', '-i', video_path,
@@ -44,11 +65,11 @@ async def add_thumbnail_to_video(video_path: str, image_path: str, output_path: 
         output_path
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info(f"FFmpeg success: {result.stderr}")
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.info("FFmpeg muvaffaqiyatli bajarildi")
         return True
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg error: {e.stderr}")
+        logger.error(f"FFmpeg xatosi: {e.stderr}")
         return False
 
 @dp.message(Command("start"))
@@ -57,10 +78,11 @@ async def start_command(message: Message, state: FSMContext):
     await message.answer(
         "🎬 <b>Video Thumbnail Setter Bot</b>\n\n"
         "Bu bot sizga video faylga o'zingiz tanlagan rasmni oblojka qilib qo'shadi.\n\n"
-        "1. Video yuboring\n"
-        "2. Rasm yuboring\n"
-        "3. Tayyor videoni oling\n\n"
-        "⚠️ Video 50 MB dan kichik, rasm JPEG va 200 KB dan kichik bo'lishi tavsiya etiladi.",
+        "1️⃣ Video yuboring (istalgan hajmda)\n"
+        "2️⃣ Rasm yuboring (avtomatik ravishda 200 KB gacha kichraytiriladi)\n"
+        "3️⃣ Tayyor videoni oling\n\n"
+        "⚠️ Rasm formati JPEG yoki PNG bo'lishi mumkin, natija JPEG formatida bo'ladi.\n"
+        "📌 /cancel - bekor qilish",
         parse_mode="HTML"
     )
     await state.set_state(ThumbnailStates.waiting_for_video)
@@ -68,9 +90,7 @@ async def start_command(message: Message, state: FSMContext):
 @dp.message(ThumbnailStates.waiting_for_video, F.video)
 async def receive_video(message: Message, state: FSMContext):
     video = message.video
-    if video.file_size > 50 * 1024 * 1024:
-        await message.answer("❌ Video hajmi 50 MB dan oshmasligi kerak.")
-        return
+    # Hajm cheklovi yo'q - faqat fayl_id olinadi
     file = await bot.get_file(video.file_id)
     video_path = f"temp_video_{uuid.uuid4()}.mp4"
     await bot.download_file(file.file_path, video_path)
@@ -80,42 +100,62 @@ async def receive_video(message: Message, state: FSMContext):
 
 @dp.message(ThumbnailStates.waiting_for_video)
 async def invalid_video(message: Message):
-    await message.answer("❌ Iltimos, video fayl yuboring.")
+    await message.answer("❌ Iltimos, video fayl yuboring (MP4 yoki boshqa format).")
 
 @dp.message(ThumbnailStates.waiting_for_image, F.photo)
 async def receive_image(message: Message, state: FSMContext):
     data = await state.get_data()
     video_path = data.get("video_path")
-    if not video_path:
-        await message.answer("❌ Xatolik. /start bilan qayta boshlang.")
+    if not video_path or not os.path.exists(video_path):
+        await message.answer("❌ Xatolik yuz berdi. /start bilan qayta boshlang.")
         await state.clear()
         return
-    photo = message.photo[-1]
+    
+    # Rasmni yuklab olish
+    photo = message.photo[-1]  # Eng yuqori sifatli rasm
     file = await bot.get_file(photo.file_id)
-    image_path = f"temp_image_{uuid.uuid4()}.jpg"
-    await bot.download_file(file.file_path, image_path)
+    raw_image_path = f"temp_image_raw_{uuid.uuid4()}.jpg"
+    await bot.download_file(file.file_path, raw_image_path)
+    
+    # Rasmni kichraytirish (200 KB dan kichik)
+    compressed_image_path = f"temp_image_compressed_{uuid.uuid4()}.jpg"
+    await compress_image(raw_image_path, compressed_image_path)
+    
+    # Vaqtinchalik fayllarni tozalash
+    os.remove(raw_image_path)
+    
     await state.set_state(ThumbnailStates.processing)
-    processing_msg = await message.answer("⏳ Video qayta ishlanmoqda...")
-    output_path = f"output_video_{uuid.uuid4()}.mp4"
-    success = await add_thumbnail_to_video(video_path, image_path, output_path)
+    processing_msg = await message.answer("⏳ Video qayta ishlanmoqda (thumbnail qo'shilmoqda)... Bu bir necha daqiqa olishi mumkin.")
+    
+    output_video_path = f"output_video_{uuid.uuid4()}.mp4"
+    success = await add_thumbnail_to_video(video_path, compressed_image_path, output_video_path)
+    
     if not success:
         await processing_msg.delete()
-        await message.answer("❌ Xatolik yuz berdi. Boshqa rasm yoki video bilan urinib ko'ring.")
-        for path in [video_path, image_path, output_path]:
+        await message.answer("❌ Video qayta ishlashda xatolik yuz berdi. Boshqa rasm yoki video bilan urinib ko'ring.")
+        for path in [video_path, compressed_image_path, output_video_path]:
             if os.path.exists(path):
                 os.remove(path)
         await state.clear()
         return
+    
     await processing_msg.delete()
     try:
-        await message.answer_video(video=FSInputFile(output_path), caption="✅ Tayyor video!", supports_streaming=True)
+        # Tayyor videoni yuborish
+        await message.answer_video(
+            video=FSInputFile(output_video_path),
+            caption="✅ Tayyor video! Endi uni asosiy botingizga yuborishingiz mumkin.",
+            supports_streaming=True
+        )
     except Exception as e:
         logger.error(f"Yuborish xatosi: {e}")
-        await message.answer("❌ Tayyor videoni yuborishda xatolik.")
+        await message.answer("❌ Tayyor videoni yuborishda xatolik yuz berdi.")
     finally:
-        for path in [video_path, image_path, output_path]:
+        # Barcha vaqtinchalik fayllarni o'chirish
+        for path in [video_path, compressed_image_path, output_video_path]:
             if os.path.exists(path):
                 os.remove(path)
+    
     await state.clear()
     await message.answer("🎬 Yana bir video uchun /start yuboring.")
 
